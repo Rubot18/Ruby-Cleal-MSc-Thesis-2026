@@ -1,0 +1,1050 @@
+##############################
+#
+# Ruby Cleal MSc Thesis 2026
+#
+##############################
+library(data.table)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(lwgeom)
+library(ggspatial)
+library(terra)
+library(tidyterra)
+library(mgcv)
+library(car)
+library(MuMIn)
+library(afex)
+library(MASS)
+library(statmod)
+library(tweedie)
+library(emmeans)
+
+setwd("/Users/rubycleal/Library/Mobile Documents/com~apple~CloudDocs/St-Andrews/Project") # Set working directory
+
+## DIVE ANALYSIS ##
+dives <- read.csv("pv43_dive.csv") # Load dive file
+
+# Summary dive parameters for Kyle Rhea
+dives2 <- subset(dives[which(dives$lat<57.27 & dives$lat>57.20 & dives$lon> -5.67 & dives$lon< -5.605),]) # Subset for dives within study site
+temp <- as.POSIXct(as.character(dives2$ds_date), "%Y/%m/%d %H:%M:%S", tz="GMT") # Create datetime object
+temp2 <- as.numeric(difftime(temp, "1970/01/01 00:00:00", tz="GMT", units="secs")) # Add time as seconds from specified date
+dives2$secs<- temp2 # Add secs field to data frame
+
+# Create the tidal file
+tide <- read.csv("tide_KL.csv") # Load tidal file
+tide$datetime<- paste(tide$date," ",tide$time, sep="") # Combine the date and time columns
+
+tide = tide[tide$height>3,] # Set high tide threshold
+temp <- as.POSIXct(as.character(tide$datetime), "%d/%m/%Y %H:%M", tz="GMT") # Create datetime object
+temp2 <- as.numeric(difftime(temp, "1970/01/01 00:00", tz="GMT", units="secs")) # Add time as seconds from specified date
+tide$secs<- temp2 # Add secs field to data frame
+rm(temp, temp2) # Removes temp and temp2 (no longer needed)
+
+ltide <- data.table(tide, key = "secs" ) # Creates tide data table, specifying to match by seconds variable
+lseals <- data.table(dives2, key = "secs" ) # Creates dives data table, specifying to match by seconds variable
+ 
+#  Join based on the key column of the two tables (secs)
+#  Roll = "nearest" gives the desired behaviour
+#  List( height, secs ) gives the columns you want to return from ltide
+tidematch<- ltide[lseals, list(secs, height, datetime) , roll = "nearest" ]
+colnames(tidematch) = c("secs", "height", "datetime")
+temp <- as.POSIXct(as.character(tidematch$datetime), "%d/%m/%Y %H:%M", tz="GMT") # Create datetime object
+temp2 <- as.numeric(difftime(temp, "1970/01/01 00:00", tz="GMT", units="secs")) # Add time as seconds from specified date
+tidematch = as.data.frame(tidematch) # Converts 'tidematch' from data table to data frame  
+tidematch$secstide = temp2 # Add secs field to data frame
+rm(temp, temp2) # Removes temp and temp2 (no longer needed)
+dives2<- dives2[order(dives2$secs),] # Sorts by secs column
+dives3<- cbind(dives2,tidematch$height, tidematch$secstide) # Combines tide height and secs column to dives
+dives3$tidediff = (dives3$secs-dives3[51])/3600 # Difference in hours from high tide where a negative value is the flood tide and a positive value is the ebb tide
+dives3$tidefactor<- ifelse(dives3$tidediff< 0, "flood", "ebb") # Creates factor for tidal state (flood/ebb)
+
+dives4 <- dives3[, c("ref", "DE_DATE", "SURF_DUR", "DIVE_DUR", "MAX_DEP", "lat", "lon", "ds_date", "tidediff", "tidefactor")] # Selecting necessary columns
+
+# SPATIAL ANALYSIS OF DIVE DATA 
+dives4_sf <- st_as_sf(dives4, coords = c("lon", "lat"), crs = 4326) # Creates spatial file from dives
+coast = st_read("SPR_DEC_2022_SC_BGC.shp") # Load coastal file
+coast = st_transform(coast, crs = 4326) # Transform coastal file to match CRS
+
+## Creating buffer to remove points on land
+dives4_proj <- st_transform(dives4_sf, 32630) # Transform to UTM for accurate metre-based buffer
+coast_proj <- st_transform(coast, 32630) 
+coastal_buffer <- st_buffer(coast_proj, 20) # Create 20m coastal buffer
+
+dives4_ocean <- dives4_proj[!apply(st_intersects( 
+  dives4_proj,
+  coastal_buffer,
+  sparse = FALSE
+), 1, any), ] # Remove points within buffer and on land
+
+dives4_ocean <- st_transform(dives4_ocean, 4326) # Transform back to 4326
+
+## Splitting study site into 4 regions
+# Visualise data to choose where to cut
+ggplot() + 
+  geom_sf(data = coast) +
+  geom_sf(data = dives4_ocean, size = 1) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.20, 57.27),
+           expand = TRUE) +
+  scale_y_continuous(breaks = seq(57.20, 57.27, by = 0.005)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.005)) +
+  theme(panel.grid.major = element_line(colour = "gray80", linewidth = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Create polygon of whole study area based on dive locations
+study_poly <- dives4_ocean |>
+  st_union() |>
+  st_convex_hull()
+
+# Create line between north and north channel
+cut1 <- st_linestring(rbind(c(-5.675, 57.265), c(-5.605, 57.240)))
+
+# Between north channel and south channel  
+cut2 <- st_linestring(rbind(c(-5.675, 57.245), c(-5.605, 57.230)))
+
+# Between south channel and south
+cut3 <- st_linestring(rbind(c(-5.675, 57.220), c(-5.605, 57.235)))
+
+cuts <- st_sfc(cut1, cut2, cut3, crs = 4326) # Creates list of cuts
+
+segments <- st_split(study_poly, cuts) |>
+  st_collection_extract("POLYGON") |>
+  st_sf(region = c("south", "south_channel", "north_channel", "north")) # Names segments
+
+# Visualise where cuts are
+ggplot() +
+  geom_sf(data = coast) +
+  geom_sf(data = study_poly, fill = "blue", alpha = 0.2) +
+  geom_sf(data = cuts, colour = "red") +
+  geom_sf(data = dives4_ocean, size = 1) +
+  scale_y_continuous(breaks = seq(57.20, 57.28, by = 0.005)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.005)) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.20, 57.27)) +
+  theme(panel.grid.major = element_line(colour = "gray80", linewidth = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot segments
+ggplot() +
+  geom_sf(data = segments, aes(fill = region), alpha = 0.4) +
+  geom_sf(data = dives4_ocean, size = 0.5) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.20, 57.27)) +
+  theme_minimal()
+
+dives4_ocean <- st_join(dives4_ocean, segments["region"]) # Adding column with region name to dataframe
+segments$region <- factor(segments$region, 
+                           levels = c("north", "north_channel", "south_channel", "south")) # Ordering regions
+
+
+######### GAMMs #################################################################################################################################################
+
+# Check classes of variables 
+class(dives4_ocean$tidediff) 
+class(dives4_ocean$ref)
+levels(dives4_ocean$ref)
+
+dives4_ocean$tidediff <- as.numeric(unlist(dives4_ocean$tidediff)) # makes tidal variable numeric
+dives4_ocean$ref <- as.factor(dives4_ocean$ref) # makes seal ID field a factor
+dives4_ocean$region <- as.factor(dives4_ocean$region) # makes region field a factor
+
+## Full Study Area - Dive Duration Predicted by Tide and Seal ID GAMM ##
+full_study_area_model_dive_dur_1 <- gam(DIVE_DUR ~ s(tidediff, bs = "cc", k = 10)  + s(ref, bs = "re"), family = Gamma(link = "log"), data = dives4_ocean, method="REML")
+# random effect of seal ID - each seal has a different baseline dive duration but the smooths for each seal are the same.
+
+## Autocorrelation checks
+acf(full_study_area_model_dive_dur_1$residuals, plot = TRUE)$acf[2] # Estimate rho - the lag 1 autocorrelation value
+# autocorrelation detected 
+
+# Thinning the data to deal with autocorrelation - all subsequent models use thinned data
+dives4_ocean_thin = dives4_ocean[seq(1, nrow(dives4_ocean), 10), ] # selecting every 10th row
+
+full_study_area_model_dive_dur_thin <- gam(DIVE_DUR ~ s(tidediff, bs = "cc", k = 10) + s(tidediff, ref, bs = "re"), family = Gamma(link = "log"), data = dives4_ocean_thin, method="REML")
+
+# ACF plot pre-thinning
+tiff("acf_pre_thin.tif", width = 90, height = 100, units = "mm", res = 300)
+acf(full_study_area_model_dive_dur_1$residuals, main = "ACF of residuals pre-thinning")
+dev.off()
+
+# ACF plot post-thinning
+tiff("acf_post_thin.tif", width = 90, height = 100, units = "mm", res = 300)
+acf(full_study_area_model_dive_dur_thin$residuals, main = "ACF of residuals post-thinning")
+dev.off()
+
+acf(full_study_area_model_dive_dur_thin$residuals, plot = TRUE)$acf[2] # Estimate rho post-thinning
+
+# Get exponentiated coefficients for intercept
+exp(coef(full_study_area_model_dive_dur_thin))[1:1]
+
+# Extract standard errors for parametric terms
+se <- summary(full_study_area_model_dive_dur_thin)$p.table[, "Std. Error"]
+coefs <- summary(full_study_area_model_dive_dur_thin)$p.table[, "Estimate"]
+
+# Calculate 95% CI and exponentiate
+data.frame(
+  estimate = exp(coefs),
+  lower = exp(coefs - 1.96 * se),
+  upper = exp(coefs + 1.96 * se)
+)
+
+# Create prediction data
+pred_data <- expand.grid(
+  tidediff = seq(min(dives4_ocean_thin$tidediff), max(dives4_ocean_thin$tidediff), length = 100),
+  ref = levels(dives4_ocean_thin$ref)[1]  # dummy ref level
+)
+
+# Predict on link scale excluding random effect
+preds <- predict(full_study_area_model_dive_dur_thin, 
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE,
+                 exclude = "s(ref)")
+
+# Back-transform predictions and CIs
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+# Plot
+dive_dur_smooth <- ggplot(pred_data, aes(x = tidediff, y = fit)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2)  +
+  geom_line(aes(y = lower), linetype = "dashed") +
+  geom_line(aes(y = upper), linetype = "dashed") +
+  geom_line() +
+  geom_vline(xintercept = 0, linetype = "longdash", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Predicted dive duration (seconds)") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10))
+
+ggsave("dive_dur_smooth.tif", dive_dur_smooth, dpi = 300, width = 120, height = 90, units = "mm", bg = "white")
+
+# Getting max and min dive dur predictions for results
+pred_data |> slice_max(fit) # Maximum predicted dive duration
+pred_data |> slice_min(fit) # Minimum predicted dive duration
+
+## Regions - Dive Duration Predicted by Tide, Region and Seal ID GAMM ##
+regions_model_dive_dur <- gam(DIVE_DUR ~ s(tidediff, by = region, bs = "cc", k = 10) + 
+              region + s(tidediff, ref, bs = "fs"), family = Gamma(link = "log"), data = dives4_ocean_thin, method="REML") # 'fs' is a factor level smooth
+
+# Model Selection
+options(na.action = "na.fail")
+d=dredge(regions_model_dive_dur, trace=FALSE,rank="AICc", evaluate=TRUE)
+d
+
+# Get exponentiated coefficients
+exp(coef(regions_model_dive_dur))[1:4]
+
+# Extract standard errors for parametric terms
+se <- summary(regions_model_dive_dur)$p.table[, "Std. Error"]
+coefs <- summary(regions_model_dive_dur)$p.table[, "Estimate"]
+
+# Calculate 95% CI and exponentiate
+data.frame(
+  estimate = exp(coefs),
+  lower = exp(coefs - 1.96 * se),
+  upper = exp(coefs + 1.96 * se)
+)
+
+## Plotting population smooth for each region
+# Create prediction data without ref dimension - need to remove to plot population level
+pred_data <- expand.grid(
+  tidediff = seq(min(dives4_ocean_thin$tidediff), max(dives4_ocean_thin$tidediff), length = 100),
+  region = levels(dives4_ocean_thin$region),
+  ref = levels(dives4_ocean_thin$ref)[1] # dummy ref level
+  )
+
+# Get predictions
+preds <- predict(regions_model_dive_dur,
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE,
+                 exclude = "s(tidediff,ref)")
+
+# Back-transform predictions and CIs
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+dives4_ocean_thin$region <- factor(dives4_ocean_thin$region, 
+                                  levels = c("north", "north_channel", "south_channel", "south"))
+
+dive_dur_reg_smooth <- ggplot(data = dives4_ocean_thin, 
+                              aes(x = tidediff, y = DIVE_DUR)) +
+  facet_wrap(~ region, labeller = labeller(region = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South"
+  ))) +
+  geom_ribbon(aes(ymin = lower,
+                  ymax = upper,
+                  x = tidediff),
+              data = pred_data,
+              alpha = 0.2,
+              inherit.aes = FALSE) +
+  geom_line(aes(y = lower), 
+            data = pred_data,
+            linetype = "dashed") +
+  geom_line(aes(y = upper), 
+            data = pred_data,
+            linetype = "dashed") +
+  geom_line(aes(y = fit), 
+            data = pred_data) +
+  geom_vline(xintercept = 0, linetype = "longdash", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Dive duration (seconds)") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        strip.text = element_text(size = 12))
+
+ggsave("dive_dur_reg_smooth.tif", dive_dur_reg_smooth, dpi = 300, width = 180, height = 120, units = "mm", bg = "white")
+
+# Getting max and min dive dur predictions for results
+pred_data |> group_by(region) |> slice_max(fit) # Maximum predicted dive duration per region
+pred_data |> group_by(region) |> slice_min(fit) # Minimum predicted dive duration per region
+
+
+## Plotting population smooth for each individual seal in each region
+pred_data <- expand.grid(
+  tidediff = seq(min(dives4_ocean_thin$tidediff), max(dives4_ocean_thin$tidediff), length = 100),
+  region = levels(dives4_ocean_thin$region),
+  ref = levels(dives4_ocean_thin$ref)
+)
+
+# Get predictions
+preds <- predict(regions_model_dive_dur ,
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE,
+)
+
+# Back-transform predictions and CIs
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+## Plotting smooths for each region with a line for each seal
+seal_ID_dur <- ggplot(data = pred_data, aes(x = tidediff, group = ref, colour = ref)) +
+  facet_wrap(~ region, labeller = labeller(region = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South"
+  ))) +
+  geom_ribbon(aes(ymin = lower,
+                  ymax = upper,
+                  fill = ref),
+              alpha = 0.1,
+              colour = NA) +
+  geom_line(aes(y = fit), linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Dive duration (seconds)",
+       colour = "Seal ID",
+       fill = "Seal ID") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 18),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14))
+
+ggsave("seal_ID_dur.tif", seal_ID_dur, dpi = 300, width = 180, height = 110, units = "mm", bg = "white")
+
+
+## Full Study Area - Max Dive Depth Predicted by Tide and Seal ID GAM ##
+full_study_area_model_max_dep <- gam(MAX_DEP ~ s(tidediff, bs = "cc", k = 10)  + s(ref, bs = "re"), family = Gamma(link = "log"), data = dives4_ocean_thin, method = "REML")
+
+# Get exponentiated coefficients for intercept
+exp(coef(full_study_area_model_max_dep))[1:1]
+
+# Extract standard errors for parametric terms
+se <- summary(full_study_area_model_max_dep)$p.table[, "Std. Error"]
+coefs <- summary(full_study_area_model_max_dep)$p.table[, "Estimate"]
+
+# Calculate 95% CI and exponentiate
+data.frame(
+  estimate = exp(coefs),
+  lower = exp(coefs - 1.96 * se),
+  upper = exp(coefs + 1.96 * se)
+)
+
+# Create prediction data
+pred_data <- expand.grid(
+  tidediff = seq(min(dives4_ocean_thin$tidediff), max(dives4_ocean_thin$tidediff), length = 100),
+  ref = levels(dives4_ocean_thin$ref)[1]  # dummy ref level
+)
+
+# Predict on response scale excluding random effect
+preds <- predict(full_study_area_model_max_dep, 
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE,
+                 exclude = "s(ref)")
+
+# Back-transform predictions and CIs
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+# Getting max and min max dive depth predictions for results
+pred_data |> slice_max(fit) # Maximum predicted max dive depth
+pred_data |> slice_min(fit) # Minimum predicted max dive depth
+
+# Plot
+max_dep_smooth <- ggplot(pred_data, aes(x = tidediff, y = fit)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(aes(y = lower), linetype = "dashed") +
+  geom_line(aes(y = upper), linetype = "dashed") +
+  geom_line() +
+  geom_vline(xintercept = 0, linetype = "longdash", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Maximum dive depth (metres)") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10))
+
+ggsave("max_dep_smooth.tif", max_dep_smooth, dpi = 300, width = 120, height = 90, units = "mm", bg = "white")
+
+
+## Regions - Max Dive Depth Predicted by Tide, Region and Seal ID GAM ##
+regions_model_max_dep <- gam(MAX_DEP ~ s(tidediff, by = region, bs = "cc", k = 10) + 
+              region + s(tidediff, ref, bs = "fs"), family = Gamma(link = "log"), data = dives4_ocean_thin, method="REML")
+
+# Get exponentiated coefficients
+exp(coef(regions_model_max_dep))[1:4]
+
+# Extract standard errors for parametric terms
+se <- summary(regions_model_max_dep)$p.table[, "Std. Error"]
+coefs <- summary(regions_model_max_dep)$p.table[, "Estimate"]
+
+# Calculate 95% CI and exponentiate
+data.frame(
+  estimate = exp(coefs),
+  lower = exp(coefs - 1.96 * se),
+  upper = exp(coefs + 1.96 * se)
+)
+
+# Create prediction data without ref dimension -  need to remove to plot population level
+pred_data <- expand.grid(
+  tidediff = seq(min(dives4_ocean_thin$tidediff), max(dives4_ocean_thin$tidediff), length = 100),
+  region = levels(dives4_ocean_thin$region),
+  ref = levels(dives4_ocean_thin$ref)[1] # dummy ref level
+)
+
+
+# Get predictions
+preds <- predict(regions_model_max_dep,
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE,
+                 exclude = "s(tidediff,ref)")
+
+# Back-transform predictions and CIs
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+# Getting max and min dive depth predictions for results
+pred_data |> group_by(region) |> slice_max(fit) # Maximum predicted max dive depth per region
+pred_data |> group_by(region) |> slice_min(fit) # Minimum predicted max dive depth per region
+
+#plot
+max_dep_reg_smooth <- ggplot(data = dives4_ocean_thin, 
+                             aes(x = tidediff, y = DIVE_DUR)) +
+  facet_wrap(~ region, labeller = labeller(region = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South"
+  ))) +
+  geom_ribbon(aes(ymin = upper,
+                  ymax = lower,
+                  x = tidediff),
+              data = pred_data,
+              alpha = 0.2,
+              inherit.aes = FALSE) +
+  geom_line(aes(y = upper), 
+            data = pred_data,
+            linetype = "dashed") +
+  geom_line(aes(y = lower), 
+            data = pred_data,
+            linetype = "dashed") +
+  geom_line(aes(y = fit), 
+            data = pred_data) +
+  geom_vline(xintercept = 0, linetype = "longdash", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Maximum dive depth (metres)") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        strip.text = element_text(size = 12))
+
+ggsave("max_dep_reg_smooth.tif", max_dep_reg_smooth, dpi = 300, width = 180, height = 120, units = "mm", bg = "white")
+
+
+## Plotting smooths for each region with a line for each seal
+## Plotting predictions for all seals in all regions on response scale
+# Setup prediction data
+pred_data <- with(dives4_ocean_thin,
+                  expand.grid(
+                    tidediff = seq(min(tidediff), max(tidediff), length = 100),
+                    ref = levels(ref),
+                    region = levels(region)))
+
+# Predict on link scale
+preds <- predict(regions_model_max_dep,
+                 newdata = pred_data,
+                 type = "link",
+                 se.fit = TRUE)
+
+# Back-transform
+pred_data$fit <- exp(preds$fit)
+pred_data$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+seal_ID_depth <- ggplot(data = pred_data, aes(x = tidediff, group = ref, colour = ref)) +
+  facet_wrap(~ region, labeller = labeller(region = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South"
+  ))) +
+  geom_ribbon(aes(ymin = lower,
+                  ymax = upper,
+                  fill = ref),
+              alpha = 0.1,
+              colour = NA) +
+  geom_line(aes(y = fit), linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray50") +
+  scale_x_continuous(breaks = seq(-6, 6, by = 2)) +
+  labs(x = "Time from high water (hours)",
+       y = "Maximum dive depth (metres)",
+       colour = "Seal ID",
+       fill = "Seal ID") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 18),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14))
+
+ggsave("seal_ID_depth.tif", seal_ID_depth, dpi = 300, width = 180, height = 110, units = "mm", bg = "white")
+
+## No. of dives analysis ##
+## Plotting mean no. of dives per region during flood vs ebb
+dives4_ocean_thin$tidefactor <- factor(dives4_ocean_thin$tidefactor, levels = c("flood", "ebb")) # reordering tidal factor
+
+## Total no. of dives per region per seal
+ggplot(dives4_ocean_thin, aes(x = region, fill = tidefactor)) +
+  geom_bar(position = "dodge") +
+  labs(x = "Region", y = "Number of dives", fill = "Tide") +
+  theme_minimal() +
+  scale_x_discrete(labels = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South")) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 10),
+        strip.text = element_text(size = 13),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16)) +
+  theme(axis.title.x = element_text(margin = margin(t = 10)))
+
+
+## Wilcoxon-signed rank test of Number of Dives Per Flood vs Ebb Full Study Area ##
+dive_counts <- dives4_ocean_thin |>
+  st_drop_geometry() |>
+  count(ref, region, tidefactor, name = "n_dives") # Get number of dives for each seal in each region and tidal state
+
+dive_total_per_seal <- dive_counts |>
+  group_by(ref, tidefactor) |>
+  summarise(total_dives = sum(n_dives), .groups = "drop") # Get total number of dives per seal per tidal state
+
+dive_wide <- dive_total_per_seal |>
+  pivot_wider(names_from = tidefactor, 
+              values_from = total_dives) # Make dive total per seal data wide 
+
+## Wilcoxon signed rank test for full study area
+wilcox.test(dive_wide$flood, dive_wide$ebb, paired = TRUE)
+
+# Median mumber of dives per seal during flood vs ebb
+dive_median <- dive_counts |>
+  group_by(ref, tidefactor) |>
+  summarise(total_dives = sum(n_dives), .groups = "drop") |>
+  group_by(tidefactor) |>
+  summarise(median_dives = median(total_dives),
+            lower = quantile(total_dives, 0.025),
+            upper = quantile(total_dives, 0.975),
+            .groups = "drop") 
+
+## Dive counts overall study area
+dive_count_overall <- ggplot(dive_median, aes(x = tidefactor, y = median_dives, colour = tidefactor)) +
+  geom_point(position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                position = position_dodge(0.3),
+                width = 0.2) +
+  scale_fill_discrete(labels = c("ebb" = "Ebb", "flood" = "Flood")) +
+  scale_x_discrete(labels = c(
+    "ebb" = "Ebb",
+    "flood" = " Flood")) +
+  labs(x = "Tidal state", y = "Median number of dives") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.position = "none")
+
+ggsave("dive_count_overall.tif", dive_count_overall, dpi = 300, width = 120, height = 100, units = "mm", bg = "white")
+
+## ANOVA of Number of Dives Flood vs Ebb within Regions ##
+ANOVA <- aov_ez(
+  id = "ref",
+  dv = "n_dives",
+  within = c("tidefactor", "region"),
+  data = dive_counts)
+
+## Post - hoc test
+# Make data wide
+dive_wide_region <- dive_counts |>
+  pivot_wider(names_from = tidefactor, values_from = n_dives)
+
+# Wilcoxon signed-rank test for each region
+# North
+wilcox.test(dive_wide_region$flood[dive_wide_region$region == "north"],
+            dive_wide_region$ebb[dive_wide_region$region == "north"],
+            paired = TRUE)
+
+# North channel
+wilcox.test(dive_wide_region$flood[dive_wide_region$region == "north_channel"],
+            dive_wide_region$ebb[dive_wide_region$region == "north_channel"],
+            paired = TRUE)
+
+# South channel
+wilcox.test(dive_wide_region$flood[dive_wide_region$region == "south_channel"],
+            dive_wide_region$ebb[dive_wide_region$region == "south_channel"],
+            paired = TRUE)
+
+# South
+wilcox.test(dive_wide_region$flood[dive_wide_region$region == "south"],
+            dive_wide_region$ebb[dive_wide_region$region == "south"],
+            paired = TRUE)
+
+# Median number of dives per region during flood vs ebb
+dive_region_median <- dive_counts |>
+  group_by(region, tidefactor) |>
+  summarise(
+    median_dives = median(n_dives),
+    lower = quantile(n_dives, 0.025),
+    upper = quantile(n_dives, 0.975),
+    .groups = "drop"
+  )
+
+# Plot 
+dive_count_region <- ggplot(dive_region_median, aes(x = region, y = median_dives, colour = tidefactor)) +
+  geom_point(position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                position = position_dodge(0.3),
+                width = 0.2) +
+  scale_colour_discrete(labels = c("ebb" = "Ebb", "flood" = "Flood")) +
+  scale_x_discrete(labels = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South")) +
+  labs(x = "Region", y = "Median number of dives", colour = "Tidal state") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12),
+        axis.text.x = element_text(angle = 60, hjust = 1))
+
+ggsave("dive_count_region.tif", dive_count_region, dpi = 300, width = 140, height = 100, units = "mm", bg = "white")
+
+
+## Calculating summary stats - tag dur, dive dur, max dive depth
+seal_summary <- dives4_ocean_thin |>
+  st_drop_geometry() |>
+  mutate(datetime = as.POSIXct(DE_DATE, format = "%Y/%m/%d %H:%M:%S", tz = "GMT")) |>
+  group_by(ref) |>
+  summarise(
+    tag_duration_days = as.numeric(difftime(max(datetime), min(datetime), units = "days")),
+    mean_dive_dur = mean(DIVE_DUR, na.rm = TRUE),
+    mean_max_depth = mean(MAX_DEP, na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+################ MAPS ##########################################################################################
+## Plain regions map
+region_map <- ggplot() +
+  geom_sf(data = segments, aes(fill = region), alpha = 0.4) +
+  geom_sf(data = coast) +
+  scale_fill_viridis_d(
+    labels = c("north" = "North", "north_channel" = "North Channel",
+               "south_channel" = "South Channel", "south" = "South")
+  ) +
+  scale_y_continuous(breaks = seq(57.20, 57.28, by = 0.01)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.01)) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.202, 57.267)) +
+  labs(fill = "Region", 
+       x = "Longitude", 
+       y = "Latitude") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 14),
+        strip.background = element_blank()) +
+  annotation_scale(
+    location = "br",
+    width_hint = 0.2,
+    pad_x = unit(0.1, "cm"),
+    pad_y = unit(0.3, "cm")
+  ) +
+  annotation_north_arrow(
+    location = "br",
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.8, "cm"), 
+    height = unit(0.8, "cm"), 
+    width = unit(0.7, "cm"),   
+  )
+
+ggsave("region_map.tif", region_map, dpi = 300, width = 150, height = 160, units = "mm", bg = "white")
+
+## Region plot with dives
+dives4_ocean_thin$tidefactor <- factor(dives4_ocean_thin$tidefactor, levels = c("flood", "ebb"))
+
+dive_region_map <- ggplot() +
+  geom_sf(data = segments, aes(fill = region), alpha = 0.4) +
+  geom_sf(data = dives4_ocean_thin, size = 0.2, alpha = 1, colour = "black") +
+  geom_sf(data = coast) +
+  scale_fill_viridis_d(
+    labels = c("north" = "North", "north_channel" = "North Channel",
+               "south_channel" = "South Channel", "south" = "South")
+  ) +
+  facet_wrap(~ tidefactor, labeller = labeller(tidefactor = c("ebb" = "Ebb", "flood" = "Flood"))) +
+  scale_y_continuous(breaks = seq(57.20, 57.28, by = 0.01)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.01)) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.202, 57.267)) +
+  labs(fill = "Region", 
+       x = "Longitude", 
+       y = "Latitude") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 14),
+        strip.background = element_blank()) +
+  annotation_scale(
+    location = "br",  
+    width_hint = 0.2,
+    pad_x = unit(0.1, "cm"),
+    pad_y = unit(0.3, "cm")
+  ) +
+  annotation_north_arrow(
+    location = "br",  
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.8, "cm"),  
+    height = unit(0.8, "cm"),  
+    width = unit(0.7, "cm"),   
+  )
+
+ggsave("dive_region_map.tif", dive_region_map, dpi = 300, width = 200, height = 160, units = "mm", bg = "white")
+
+## Bathymetry map
+rasterFilePath = "/Users/rubycleal/Library/Mobile Documents/com~apple~CloudDocs/St-Andrews/Project/TruDepthScotGov_KyleRhea_Gordon.grd"
+depthRaster <- rast(rasterFilePath)
+global(depthRaster, fun = c("min", "max", "mean"), na.rm = TRUE)
+
+bathymetry_map <- ggplot() +
+  geom_spatraster(data = depthRaster) +
+  scale_fill_viridis_c(option = "mako", na.value = NA, name = "Depth (m)") +
+  geom_sf(data = coast) +
+  theme_minimal() +
+  geom_sf(data = coast) +
+  scale_y_continuous(breaks = seq(57.20, 57.28, by = 0.01)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.01)) +
+  labs( x = "Longitude",
+        y = "Latitude") +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.203, 57.267))+
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks = element_line(colour = "black")) +
+  annotation_scale(
+    location = "br",  
+    width_hint = 0.2,
+    pad_x = unit(0.1, "cm"),
+    pad_y = unit(0.3, "cm")
+  ) +
+  annotation_north_arrow(
+    location = "br", 
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.8, "cm"), 
+    height = unit(0.8, "cm"), 
+    width = unit(0.7, "cm"),   
+  )
+
+ggsave("bathymetry_map.tif", bathymetry_map, dpi = 300, width = 150, height = 160, units = "mm", bg = "white")
+
+## Getting depth information
+# Make sure segments is in the same CRS as the raster
+segments_proj <- st_transform(segments, crs(depthRaster))
+depth_extract <- extract(depthRaster, vect(segments_proj), 
+                         fun = function(x) c(mean = mean(x, na.rm = TRUE),
+                                             min = min(x, na.rm = TRUE),
+                                             max = max(x, na.rm = TRUE)))
+
+depth_extract <- as.data.frame(depth_extract)
+depth_extract$region <- segments_proj$region # Add region names
+
+### Map of skye
+skye_map <- ggplot() +
+  geom_sf(data = coast) +
+  theme_minimal() +
+  geom_sf(data = coast) +
+  scale_y_continuous(breaks = seq(56.8, 57.8, by = 0.2)) +
+  scale_x_continuous(breaks = seq(-6.6, -5.4, by = 0.2)) +
+  labs(x = "Longitude", 
+       y = "Latitude") +
+  coord_sf(xlim = c(-6.7, -5.3),
+           ylim = c(56.7, 57.9)) +
+  annotate("rect", xmin = -5.67, xmax = -5.61, ymin = 57.202, ymax = 57.267,
+           fill = NA, colour = "red", linewidth = 0.8) +
+  annotate("text", x = -6.22, y = 57.28, label = "Isle of Skye", 
+           fontface = "italic", size = 3) + 
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks = element_line(colour = "black")) +
+  annotation_scale(
+    location = "br",  # top-left
+    width_hint = 0.2,
+    pad_x = unit(0.1, "cm"),
+    pad_y = unit(0.3, "cm")
+  ) +
+  annotation_north_arrow(
+    location = "br",  # also top-left
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.8, "cm"),  # push it down below the scale bar
+    height = unit(0.8, "cm"),  # control size
+    width = unit(0.7, "cm"),   # control size
+  )
+
+ggsave("skye_map.tif", skye_map, dpi = 300, width = 150, height = 160, units = "mm", bg = "white")
+
+
+## FISH ANALYSIS ##
+fishdata <- read.csv('data.csv')
+
+# summing acoustic depth layers
+# Sum schools and fish counts across depth intervals
+fish_totals <- fishdata %>%
+  group_by(Interval) %>%
+  summarise(school.NASC = sum(school.NASC),
+            n.fish = sum(n.fish))
+
+# Select one row per Interval for all other columns
+fish_other <- fishdata %>%
+  distinct(Interval, .keep_all = TRUE) %>%
+  dplyr::select(-school.NASC, -n.fish)
+
+# Combine
+fishdata_sum <- fish_other %>%
+  left_join(fish_totals, by = "Interval")
+
+fishdata_sf = st_as_sf(fishdata_sum, coords = c("lon", "lat"), crs = 4326)
+
+# Creating buffer to remove points on land
+fishdataa_proj <- st_transform(fishdata_sf, 32630) # Transform to UTM for accurate metre-based buffer
+coastdata_proj <- st_transform(coast, 32630)
+coastal_buffer <- st_buffer(coastdata_proj, 20) # Create 20m coastal buffer
+
+fishdata_ocean <- fishdataa_proj[!apply(st_intersects(
+  fishdataa_proj,
+  coastal_buffer,
+  sparse = FALSE
+), 1, any), ] # Remove points within buffer and on land
+
+fishdata_ocean <- st_transform(fishdata_ocean, 4326) # Transform back to 4326
+
+## Adding region column to fish dataframe
+fishdata_ocean <- st_join(fishdata_ocean, segments["region"]) # adding region column
+
+# Reordering regions
+fishdata_ocean$region <- factor(fishdata_ocean$region, 
+                                levels = c("north", "north_channel", "south_channel", "south"))
+
+# Reordering tidal factor
+fishdata_ocean$tide <- factor(fishdata_ocean$tide, levels = c("flood", "ebb"))
+
+############### GLMS ################################################################################################
+colSums(is.na(fishdata_ocean[c("n.fish", "tide", "region")]))
+fishdata_ocean <- fishdata_ocean[!is.na(fishdata_ocean$region), ] # removing NAs 
+
+## Full Study Site - Fish Shoals Predicted by Tide GLM 
+shoals_glm_tweedie <- glm(school.NASC ~ tide, family = tweedie(var.power = 1.5, link.power = 0), data = fishdata_ocean)
+
+#Deviance explained
+(shoals_glm_tweedie$null.deviance - shoals_glm_tweedie$deviance) / shoals_glm_tweedie$null.deviance * 100
+
+# Create prediction data
+pred_data_overall <- data.frame(tide = c("ebb", "flood"))
+
+# Get predictions on link scale (log)
+preds <- predict(shoals_glm_tweedie, 
+                 newdata = pred_data_overall, 
+                 type = "link", 
+                 se.fit = TRUE)
+
+# Calculate CIs on link scale then back-transform
+pred_data_overall$fit <- exp(preds$fit)
+pred_data_overall$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+pred_data_overall$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+# Reorder tide
+pred_data_overall$tide <- factor(pred_data_overall$tide, levels = c("flood", "ebb"))
+
+# Plot
+tweedie_overall_shoals <- ggplot(pred_data_overall, aes(x = tide, y = fit, colour = tide)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper), 
+                width = 0.2) +
+  scale_x_discrete(labels = c("ebb" = "Ebb", "flood" = "Flood")) +
+  scale_colour_discrete(labels = c("ebb" = "Ebb", "flood" = "Flood")) +
+  xlab("Tidal state") + 
+  ylab(expression(atop("Fish biomass (NASC: m² nm"^{scriptstyle(-2)}*")", "per 50 m section of survey track"))) +
+  labs(colour = "Tidal State") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 11),
+        axis.text = element_text(size = 10),
+        legend.position = "none") +
+  theme(plot.margin = unit(c(1, 0.5, 0.5, 1.2), "cm"))
+
+ggsave("tweedie_overall_shoals.tif", tweedie_overall_shoals, dpi = 300, width = 140, height = 100, units = "mm", bg = "white")
+
+## Regions - Shoals predicted by tide and region GLM
+regions_shoals_glm_tweedie <- glm(school.NASC ~ tide * region, family = tweedie(var.power = 1.5, link.power = 0), data = fishdata_ocean)
+
+emmeans(regions_shoals_glm_tweedie, pairwise ~ tide | region, type = "response") # comparing fish between tides within region
+
+preds_region <- expand.grid(
+  tide = c("ebb", "flood"),
+  region = levels(fishdata_ocean$region)
+)
+
+preds <- predict(regions_shoals_glm_tweedie,
+                 newdata = preds_region,
+                 type = "link",
+                 se.fit = TRUE)
+
+preds_region$fit   <- exp(preds$fit)
+preds_region$lower <- exp(preds$fit - 1.96 * preds$se.fit)
+preds_region$upper <- exp(preds$fit + 1.96 * preds$se.fit)
+
+# Deviance explained
+(regions_shoals_glm_tweedie$null.deviance - regions_shoals_glm_tweedie$deviance) / regions_shoals_glm_tweedie$null.deviance * 100
+
+# Reorder tide
+preds_region$tide <- factor(preds_region$tide, levels = c("flood", "ebb"))
+
+tweedie_region_shoals <- ggplot(preds_region, aes(x = tide, y = fit, colour = tide)) +
+  geom_point(position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), 
+                width = 0.2) +
+  scale_x_discrete(labels = c("ebb" = "Ebb", "flood" = "Flood")) +
+  facet_wrap(~ region, scales = "free_y", labeller = labeller(region = c(
+    "north" = "North",
+    "north_channel" = "North Channel",
+    "south_channel" = "South Channel",
+    "south" = "South"))) +
+  xlab("Tidal state") +
+  ylab(expression(atop("Fish biomass (NASC: m² nm"^{scriptstyle(-2)}*")", "per 50 m section of survey track"))) +
+  labs(colour = "Tidal State") + 
+  theme_minimal() +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        strip.text = element_text(size = 12),
+        legend.position = "none") +
+  theme(plot.margin=unit(c(1,0.5,0.5,1.2),"cm"))
+
+ggsave("tweedie_region_shoals.tif", tweedie_region_shoals, dpi = 300, width = 180, height = 120, units = "mm", bg = "white")
+
+## NASC summary stats
+fish_summary <- fishdata_ocean |>
+  group_by(tide) |>
+  summarise(
+    max_nasc = max(school.NASC, na.rm = TRUE),
+    min_nasc = min(school.NASC[school.NASC > 0], na.rm = TRUE),
+    mean_nasc = mean(school.NASC, na.rm = TRUE),
+    n_tracks_with_fish = sum(school.NASC > 0),
+    n_tracks_total = n(),
+    proportion_with_fish = n_tracks_with_fish / n_tracks_total,
+    .groups = "drop"
+  )
+
+################### MAPS ##################################################### ################### ################### 
+
+## Region plot for methods
+
+fish_region_map <- ggplot() +
+  geom_sf(data = segments, aes(fill = region), alpha = 0.4) +
+  geom_sf(data = fishdata_ocean[fishdata_ocean$school.NASC == 0, ], 
+          size = 0.5, col = "gray40") +
+  geom_sf(data = fishdata_ocean[fishdata_ocean$school.NASC > 0, ], 
+          aes(size = school.NASC, col = school.NASC), alpha = 0.7) +
+  geom_sf(data = coast) +
+  scale_fill_viridis_d(
+    labels = c("north" = "North", "north_channel" = "North Channel",
+               "south_channel" = "South Channel", "south" = "South")
+  ) +
+  scale_y_continuous(breaks = seq(57.20, 57.28, by = 0.01)) +
+  scale_x_continuous(breaks = seq(-5.67, -5.61, by = 0.01)) +
+  coord_sf(xlim = c(-5.67, -5.61),
+           ylim = c(57.202, 57.267)) +
+  facet_wrap(~ tide, labeller = labeller(tide = c("ebb" = "Ebb", "flood" = "Flood"))) +
+  labs(fill = "Region", 
+       colour = expression("Fish biomass (NASC: m² nm"^{scriptstyle(-2)}*")"),
+       x = "Longitude", 
+       y = "Latitude") +
+  scale_color_viridis_c(option = "viridis", guide = "legend", name = bquote("Fish biomass (NASC:"~m^2~""~nm^-2~")")) +
+  guides(
+    fill = guide_legend(order = 1),
+    colour = guide_colourbar(reverse = TRUE, order = 2),
+    size = guide_legend(title = NULL, order = 3)
+  ) +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 14),
+        strip.background = element_blank()) +
+  annotation_scale(
+    location = "br",  
+    width_hint = 0.2,
+    pad_x = unit(0.1, "cm"),
+    pad_y = unit(0.3, "cm")
+  ) +
+  annotation_north_arrow(
+    location = "br", 
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.8, "cm"),  
+    height = unit(0.8, "cm"),  
+    width = unit(0.7, "cm")
+  )
+
+ggsave("fish_region_map.tif", fish_region_map, dpi = 300, width = 210, height = 180, units = "mm", bg = "white")
+
+
+
